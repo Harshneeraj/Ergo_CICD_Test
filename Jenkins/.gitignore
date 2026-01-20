@@ -1,6 +1,6 @@
-# # Env routing configs
-# dev.env
-# prod.env
+# Env routing configs
+dev.env
+prod.env
 
-# # Jenkins files
-# Jenkinsfile
+# Jenkins files
+Jenkinsfile

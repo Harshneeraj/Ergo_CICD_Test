@@ -1,6 +1,5 @@
 # Env routing configs
-dev.env
-prod.env
+*.env
 
 # Jenkins files
 Jenkinsfile

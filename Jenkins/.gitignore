@@ -1,5 +1,0 @@
-# Env routing configs
-*.env
-
-# Jenkins files
-Jenkinsfile

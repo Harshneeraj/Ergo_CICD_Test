@@ -1,6 +1,12 @@
 pipeline {
     agent any
 
+    options {
+        // Multibranch already does checkout scm
+        // Keep workspace clean
+        timestamps()
+    }
+
     parameters {
         booleanParam(
             name: 'FORCE_DEPLOY',
@@ -10,34 +16,36 @@ pipeline {
     }
 
     environment {
-        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+        // Credentials are safe here
         GCP_SA_KEY = credentials('gcp-service-account-key')
     }
 
     stages {
 
         /* ============================================================
-           INIT + ENV FILE SELECTION
+           INIT + BRANCH + IMAGE TAG
         ============================================================ */
-        stage('Checkout & Init') {
+        stage('Init') {
             steps {
                 script {
-                    checkout scm
+                    echo "Branch name: ${env.BRANCH_NAME}"
+                    echo "Commit: ${env.GIT_COMMIT}"
 
-                    def branch = env.GIT_BRANCH ?: 'unknown'
-                    echo "Branch detected: ${branch}"
+                    // Compute IMAGE_TAG AFTER checkout
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
 
-                    if (branch.contains('prod') || branch.contains('main')) {
-                        env.ENV_FILE = 'prod.env'
+                    if (env.BRANCH_NAME in ['prod', 'main']) {
+                        env.ENV_FILE   = 'prod.env'
                         env.TARGET_ENV = 'PROD'
-                    } else if (branch.contains('dev') || branch.contains('uat')) {
-                        env.ENV_FILE = 'dev.env'
+                    } else if (env.BRANCH_NAME in ['dev', 'uat']) {
+                        env.ENV_FILE   = 'dev.env'
                         env.TARGET_ENV = 'DEV'
                     } else {
-                        error("❌ Unsupported branch for deployment")
+                        error("❌ Unsupported branch: ${env.BRANCH_NAME}")
                     }
 
-                    echo "Target env: ${env.TARGET_ENV}"
+                    echo "Target environment: ${env.TARGET_ENV}"
                     echo "Using env file: ${env.ENV_FILE}"
                 }
             }
@@ -50,12 +58,13 @@ pipeline {
             steps {
                 script {
                     if (!fileExists(env.ENV_FILE)) {
-                        error("❌ ${env.ENV_FILE} not found")
+                        error("❌ ${env.ENV_FILE} not found in repo")
                     }
 
                     readFile(env.ENV_FILE).split('\n').each { line ->
                         line = line.trim()
                         if (!line || line.startsWith('#')) return
+
                         def (k, v) = line.split('=', 2)
                         env[k] = v
                     }
@@ -64,18 +73,6 @@ pipeline {
                 }
             }
         }
-
-        /* ============================================================
-           GCP AUTH
-        ============================================================ */
-        // stage('GCP Auth') {
-        //     steps {
-        //         sh """
-        //             gcloud auth activate-service-account --key-file=${GCP_SA_KEY}
-        //             gcloud config set project ${PROJECT_ID}
-        //         """
-        //     }
-        // }
 
         /* ============================================================
            DETECT CHANGED DEPLOYMENTS
@@ -87,8 +84,9 @@ pipeline {
 
                     env.each { k, v ->
                         if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
-                            def name = k.replace('DEPLOY_', '').replace('_PATH', '')
-                            deployments << name
+                            deployments << k
+                                .replace('DEPLOY_', '')
+                                .replace('_PATH', '')
                         }
                     }
 
@@ -112,7 +110,7 @@ pipeline {
                         env.SKIP_DEPLOY = 'true'
                     } else {
                         env.CHANGED_DEPLOYS = changed.join(',')
-                        echo "Deploying components: ${env.CHANGED_DEPLOYS}"
+                        echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
                     }
                 }
             }
@@ -121,26 +119,26 @@ pipeline {
         /* ============================================================
            DEPLOY
         ============================================================ */
-        // stage('Deploy') {
-        //     when {
-        //         expression { env.SKIP_DEPLOY != 'true' }
-        //     }
-        //     steps {
-        //         script {
-        //             env.CHANGED_DEPLOYS.split(',').each { name ->
-        //                 def type = env["DEPLOY_${name}_TYPE"]
+        stage('Deploy') {
+            when {
+                expression { env.SKIP_DEPLOY != 'true' }
+            }
+            steps {
+                script {
+                    env.CHANGED_DEPLOYS.split(',').each { name ->
+                        def type = env["DEPLOY_${name}_TYPE"]
 
-        //                 if (type == 'GCS') {
-        //                     deployToGCS(name)
-        //                 } else if (type == 'CLOUDRUN') {
-        //                     deployToCloudRun(name)
-        //                 } else {
-        //                     error("❌ Unknown DEPLOY type for ${name}")
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+                        if (type == 'GCS') {
+                            deployToGCS(name)
+                        } else if (type == 'CLOUDRUN') {
+                            deployToCloudRun(name)
+                        } else {
+                            error("❌ Unknown DEPLOY type for ${name}")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     post {

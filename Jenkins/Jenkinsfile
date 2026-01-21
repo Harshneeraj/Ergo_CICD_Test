@@ -17,7 +17,7 @@ pipeline {
 
     environment {
         // Credentials are safe here
-        GCP_SA_KEY = credentials('gcp-service-account-key')
+        GCP_SA_KEY = "abc"
     }
 
     stages {

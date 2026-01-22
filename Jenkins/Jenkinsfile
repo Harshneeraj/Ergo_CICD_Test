@@ -67,9 +67,11 @@ pipeline {
 
                         def deployments = []
 
-                        env.each { k, v ->
+                        envMap.keySet().each { k ->
                             if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
-                                deployments << k.replace('DEPLOY_', '').replace('_PATH', '')
+                                deployments << k
+                                    .replace('DEPLOY_', '')
+                                    .replace('_PATH', '')
                             }
                         }
 

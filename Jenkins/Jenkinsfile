@@ -2,132 +2,152 @@ pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
+        timestamps()
+    }
+
+    parameters {
+        booleanParam(
+            name: 'FORCE_DEPLOY',
+            defaultValue: false,
+            description: 'Force deployment even if no changes detected'
+        )
+    }
+
+    environment {
+        GCP_SA_KEY = "abc"
     }
 
     stages {
 
-        /* -------------------- BRANCH GUARD -------------------- */
-        stage('Validate Branch') {
-            when {
-                not {
-                    anyOf {
-                        branch 'dev'
-                        branch 'prod'
+        stage('Init') {
+            steps {
+                script {
+                    echo "Branch name: ${env.BRANCH_NAME}"
+                    echo "Commit: ${env.GIT_COMMIT}"
+
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
+
+                    if (env.BRANCH_NAME in ['prod', 'main']) {
+                        env.ENV_FILE   = 'Jenkins/prod.env'
+                        env.TARGET_ENV = 'PROD'
+                    } else if (env.BRANCH_NAME in ['dev', 'uat']) {
+                        env.ENV_FILE   = 'Jenkins/dev.env'
+                        env.TARGET_ENV = 'DEV'
+                    } else {
+                        error("❌ Unsupported branch: ${env.BRANCH_NAME}")
+                    }
+
+                    echo "Target environment: ${env.TARGET_ENV}"
+                    echo "Using env file: ${env.ENV_FILE}"
+                }
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                script {
+                    if (!fileExists(env.ENV_FILE)) {
+                        error("❌ ${env.ENV_FILE} not found in repo")
+                    }
+
+                    // Read file LOCALLY (not env)
+                    def envContent = readFile(env.ENV_FILE)
+
+                    def envMap = [:]
+
+                    envContent.split('\n').each { line ->
+                        line = line.trim()
+                        if (!line || line.startsWith('#')) return
+
+                        def parts = line.split('=', 2)
+                        envMap.put(parts[0], parts[1])
+                    }
+
+                    withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
+
+                        def deployments = []
+
+                        envMap.keySet().each { k ->
+                            if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
+                                deployments << k
+                                    .replace('DEPLOY_', '')
+                                    .replace('_PATH', '')
+                            }
+                        }
+
+                        def changed = []
+
+                        deployments.each { name ->
+                            def path = env["DEPLOY_${name}_PATH"]
+
+                            def diff = sh(
+                                script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
+                                returnStdout: true
+                            ).trim()
+
+                            if (diff || params.FORCE_DEPLOY) {
+                                changed << name
+                            }
+                        }
+
+                        if (changed.isEmpty()) {
+                            echo "⚠️ No changes detected"
+                            env.SKIP_DEPLOY = 'true'
+                        } else {
+                            env.CHANGED_DEPLOYS = changed.join(',')
+                            echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
+                        }
                     }
                 }
             }
-            steps {
-                error "❌ Pipeline allowed only for dev or prod branches"
-            }
         }
 
-        /* -------------------- CHECKOUT -------------------- */
-        stage('Checkout') {
-            when {
-                anyOf {
-                    branch 'dev'
-                    branch 'prod'
-                }
-            }
-            steps {
-                checkout scm
-            }
-        }
 
-        /* -------------------- LOAD ENV -------------------- */
-        stage('Load Env Config') {
+        stage('Deploy') {
             when {
-                anyOf {
-                    branch 'dev'
-                    branch 'prod'
-                }
+                expression { env.SKIP_DEPLOY != 'true' }
             }
             steps {
                 script {
-                    def envFile = (env.BRANCH_NAME == 'prod')
-                        ? 'env/prod.env'
-                        : 'env/dev.env'
+                    def envMap = [:]
 
-                    sh """
-                        set -a
-                        source ${envFile}
-                        set +a
-                        env > full.env
-                    """
+                    env.DYNAMIC_ENV.split('\n').each { line ->
+                        line = line.trim()
+                        if (!line || line.startsWith('#')) return
+                        def (k, v) = line.split('=', 2)
+                        envMap[k] = v
+                    }
+
+                    withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
+
+                        env.CHANGED_DEPLOYS.split(',').each { name ->
+                            def type = env["DEPLOY_${name}_TYPE"]
+
+                            if (type == 'GCS') {
+                                deployToGCS(name)
+                            } else if (type == 'CLOUDRUN') {
+                                deployToCloudRun(name)
+                            } else {
+                                error("❌ Unknown DEPLOY type for ${name}")
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
 
-        /* -------------------- DETECT CHANGES -------------------- */
-        stage('Detect Changes') {
-            when {
-                anyOf {
-                    branch 'dev'
-                    branch 'prod'
-                }
-            }
-            steps {
-                script {
-                    def diff = sh(
-                        script: "git diff --name-only HEAD~1 HEAD",
-                        returnStdout: true
-                    ).trim()
-
-                    writeFile file: 'changed_files.txt', text: diff
-                }
-            }
+    post {
+        success {
+            echo "🎉 Deployment successful for ${env.TARGET_ENV}"
         }
-
-        /* -------------------- ROUTE & DEPLOY -------------------- */
-        stage('Route & Deploy') {
-            when {
-                anyOf {
-                    branch 'dev'
-                    branch 'prod'
-                }
-            }
-            steps {
-                script {
-                    sh """
-                        source full.env
-
-                        DEPLOYS=\$(env | grep '^DEPLOY_.*_PATH=' | sed 's/DEPLOY_//' | sed 's/_PATH=.*//')
-
-                        for name in \$DEPLOYS; do
-                          PATH_VAR="DEPLOY_\${name}_PATH"
-                          TYPE_VAR="DEPLOY_\${name}_TYPE"
-
-                          DEPLOY_PATH=\${!PATH_VAR}
-                          DEPLOY_TYPE=\${!TYPE_VAR}
-
-                          if grep -q "^\\\${DEPLOY_PATH}" changed_files.txt; then
-                            echo "🔁 Change detected in \$DEPLOY_PATH"
-
-                            if [ "\$DEPLOY_TYPE" = "GCS" ]; then
-                              BUCKET_VAR="DEPLOY_\${name}_GCS_BUCKET"
-                              PREFIX_VAR="DEPLOY_\${name}_GCS_PREFIX"
-
-                              gsutil -m rsync -r \$DEPLOY_PATH gs://\${!BUCKET_VAR}/\${!PREFIX_VAR}
-
-                            elif [ "\$DEPLOY_TYPE" = "CLOUDRUN" ]; then
-                              IMAGE_VAR="DEPLOY_\${name}_IMAGE"
-                              SERVICE_VAR="DEPLOY_\${name}_SERVICE"
-
-                              gcloud auth configure-docker ${REGION}-docker.pkg.dev
-
-                              docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/\${!IMAGE_VAR}:latest \$DEPLOY_PATH
-                              docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/\${!IMAGE_VAR}:latest
-
-                              gcloud run deploy \${!SERVICE_VAR} \
-                                --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/\${!IMAGE_VAR}:latest \
-                                --region ${REGION} \
-                                --platform managed \
-                                --allow-unauthenticated
-                            fi
-                          fi
-                        done
-                    """
+        failure {
+            echo "❌ Deployment failed"
+        }
+        always {
+            script {
+                if (env.WORKSPACE) {
+                    cleanWs()
                 }
             }
         }

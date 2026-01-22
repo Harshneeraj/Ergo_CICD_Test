@@ -123,9 +123,10 @@ pipeline {
                                 echo "🪣 Deploying changed files to GCS for ${name}"
 
                                 changedFiles.split('\n').each { file ->
-                                    sh """
+                                    echo """
                                         gsutil cp ${file} gs://${bucket}/${prefix}/${file.replaceFirst("^${path}/?", "")}
                                     """
+                                    // change to sh here
                                 }
                             }
 
@@ -134,7 +135,7 @@ pipeline {
                             ============================================================ */
                             else if (type == 'CLOUDRUN') {
                                 echo "☁️ Deploying ${name} to Cloud Run"
-                                deployToCloudRun(name)
+                                // deployToCloudRun(name) -- Uncomment this
                             }
 
                             else {

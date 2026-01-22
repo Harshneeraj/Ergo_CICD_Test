@@ -100,7 +100,7 @@ pipeline {
                     //         env.CHANGED_DEPLOYS = changed.join(',')
                     //         echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
                     //     }
-                    }
+                    // }
                 }
             }
         }

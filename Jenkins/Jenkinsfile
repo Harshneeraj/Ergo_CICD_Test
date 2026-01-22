@@ -36,10 +36,10 @@ pipeline {
                     echo "Image tag: ${env.IMAGE_TAG}"
 
                     if (env.BRANCH_NAME in ['prod', 'main']) {
-                        env.ENV_FILE   = 'prod.env'
+                        env.ENV_FILE   = 'Jenkins/prod.env'
                         env.TARGET_ENV = 'PROD'
                     } else if (env.BRANCH_NAME in ['dev', 'uat']) {
-                        env.ENV_FILE   = 'dev.env'
+                        env.ENV_FILE   = 'Jenkins/dev.env'
                         env.TARGET_ENV = 'DEV'
                     } else {
                         error("❌ Unsupported branch: ${env.BRANCH_NAME}")

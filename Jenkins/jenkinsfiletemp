@@ -1,561 +1,102 @@
-pipeline {
-    agent any
-    
-    // Pipeline is triggered by Bitbucket webhooks
-    
-    parameters {
-        string(
-            name: 'BRANCH_NAME',
-            defaultValue: '',
-            description: 'Branch name from Bitbucket webhook (auto-populated)'
-        )
-        booleanParam(
-            name: 'FORCE_API_DEPLOY',
-            defaultValue: false,
-            description: 'Force API deployment regardless of changes'
-        )
-        booleanParam(
-            name: 'FORCE_DAG_DEPLOY',
-            defaultValue: false,
-            description: 'Force DAG deployment regardless of changes'
-        )
-        booleanParam(
-            name: 'RUN_BRANCH_CLEANUP',
-            defaultValue: false,
-            description: 'Run branch cleanup after deployment'
-        )
-        booleanParam(
-            name: 'SINGLE_TAG_ONLY',
-            defaultValue: true,  // Changed to true - only push versioned tag
-            description: 'Push only versioned tag (skip latest tag)'
-        )
-    }
-    
-    environment {
-        // GCP Configuration
-        GCP_PROJECT_ID = 'prj-srv-data-lake-uate7'
-        GCP_REGION = 'asia-south1'
-        
-        // Container Registry Configuration
-        REGISTRY_REPOSITORY = 'nginx'  // Repository name in Artifact Registry
-        IMAGE_NAME = 'hdfcergo-duckcreek'
-        
-        // Dynamic Image Tag: BUILD_NUMBER-GIT_COMMIT_SHORT
-        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
-        
-        // Full registry path
-        ARTIFACT_REGISTRY = "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${REGISTRY_REPOSITORY}"
-        
-        // Cloud Run Configuration (update these service names as needed)
-        CLOUD_RUN_SERVICE_UAT = 'hdfcergo-duckcreek-uat'
-        CLOUD_RUN_SERVICE_PROD = 'hdfcergo-duckcreek-prod'
-        
-        // Cloud Storage for DAGs (update project ID if different for GCS)
-        GCS_PROJECT_ID = 'prj-srv-data-lake-uate7'  // Can be different from main project
-        GCS_BUCKET_UAT = "gs://${GCS_PROJECT_ID}-airflow-dags-uat"
-        GCS_BUCKET_PROD = "gs://${GCS_PROJECT_ID}-airflow-dags-prod"
-        
-        // Service Account
-        GCP_SA_KEY = credentials('gcp-service-account-key')
-        
-        // Paths
-        API_PATH = 'api/'
-        DAG_PATH = 'dags/'
-        
-        // Change Detection Flags
-        API_CHANGED = 'false'
-        DAG_CHANGED = 'false'
-        
-        // Branch Cleanup
-        PROTECTED_BRANCHES = 'main,master,develop,dev,uat,prod,production,staging'
-        BRANCH_CLEANUP_DAYS = '30'
-    }
-    
-    stages {
-        stage('Initialize') {
-            steps {
-                script {
-                    echo "=" * 80
-                    echo "CI/CD Pipeline Triggered by Bitbucket Webhook"
-                    echo "=" * 80
-                    echo "Checkout and determine environment..."
-                    checkout scm
-                    
-                    // Determine environment from branch name
-                    def branch = env.GIT_BRANCH ?: params.BRANCH_NAME ?: 'unknown'
-                    echo "Detected branch: ${branch}"
-                    
-                    if (branch.contains('prod') || branch.contains('main')) {
-                        env.TARGET_ENV = 'PROD'
-                        env.GCS_BUCKET = env.GCS_BUCKET_PROD
-                        env.CLOUD_RUN_SERVICE = env.CLOUD_RUN_SERVICE_PROD
-                    } else if (branch.contains('uat') || branch.contains('dev')) {
-                        env.TARGET_ENV = 'UAT'
-                        env.GCS_BUCKET = env.GCS_BUCKET_UAT
-                        env.CLOUD_RUN_SERVICE = env.CLOUD_RUN_SERVICE_UAT
-                    } else {
-                        error("⚠️ Deployment not allowed for branch: ${branch}. Only prod/main/uat/dev branches are supported.")
-                    }
-                    
-                    echo "🎯 Target Environment: ${env.TARGET_ENV}"
-                    echo "📦 GCS Bucket: ${env.GCS_BUCKET}"
-                    echo "☁️  Cloud Run Service: ${env.CLOUD_RUN_SERVICE}"
-                }
+stage('Detect & Deploy') {
+    steps {
+        script {
+            if (!fileExists(env.ENV_FILE)) {
+                error("❌ ${env.ENV_FILE} not found in repo")
             }
-        }
-        
-        stage('Detect Changes') {
-            steps {
-                script {
-                    echo "Analyzing changes to determine deployment scope..."
-                    
-                    // Check for API changes
-                    def apiChanges = sh(
-                        script: """
-                            if [ \$(git diff HEAD~1 HEAD --name-only | grep '^${API_PATH}' | wc -l) -gt 0 ]; then
-                                echo 'true'
-                            else
-                                echo 'false'
-                            fi
-                        """,
+
+            /* ============================================================
+               LOAD ENV FILE INTO MAP
+            ============================================================ */
+            def envMap = [:]
+
+            readFile(env.ENV_FILE).split('\n').each { line ->
+                line = line.trim()
+                if (!line || line.startsWith('#')) return
+
+                def (k, v) = line.split('=', 2)
+                envMap[k] = v
+            }
+
+            /* ============================================================
+               EXPORT ENV VARS (SAFE)
+            ============================================================ */
+            withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
+
+                /* ============================================================
+                   FIND DEPLOYMENTS
+                ============================================================ */
+                def deployments = []
+
+                envMap.keySet().each { k ->
+                    if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
+                        deployments << k
+                            .replace('DEPLOY_', '')
+                            .replace('_PATH', '')
+                    }
+                }
+
+                if (deployments.isEmpty()) {
+                    echo "⚠️ No deployments defined"
+                    return
+                }
+
+                /* ============================================================
+                   PROCESS EACH DEPLOYMENT
+                ============================================================ */
+                deployments.each { name ->
+                    def path = env["DEPLOY_${name}_PATH"]
+                    def type = env["DEPLOY_${name}_TYPE"]
+
+                    if (!path || !type) {
+                        error("❌ Missing DEPLOY_${name}_PATH or DEPLOY_${name}_TYPE")
+                    }
+
+                    echo "🔍 Checking changes for ${name}"
+
+                    def changedFiles = sh(
+                        script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
                         returnStdout: true
                     ).trim()
-                    
-                    // Check for DAG changes
-                    def dagChanges = sh(
-                        script: """
-                            if [ \$(git diff HEAD~1 HEAD --name-only | grep '^${DAG_PATH}' | wc -l) -gt 0 ]; then
-                                echo 'true'
-                            else
-                                echo 'false'
-                            fi
-                        """,
-                        returnStdout: true
-                    ).trim()
-                    
-                    env.API_CHANGED = params.FORCE_API_DEPLOY ? 'true' : apiChanges
-                    env.DAG_CHANGED = params.FORCE_DAG_DEPLOY ? 'true' : dagChanges
-                    
-                    echo "📊 Change Detection Results:"
-                    echo "   API Changes: ${env.API_CHANGED}"
-                    echo "   DAG Changes: ${env.DAG_CHANGED}"
-                    
-                    if (env.API_CHANGED == 'false' && env.DAG_CHANGED == 'false') {
-                        echo "⚠️ No changes detected in API or DAG paths."
-                        echo "   Pipeline will skip deployment and proceed to cleanup if enabled."
-                        currentBuild.description = "No deployment needed - no changes in api/ or dags/"
+
+                    if (!changedFiles && !params.FORCE_DEPLOY) {
+                        echo "⏭️ No changes for ${name}"
+                        return
                     }
-                }
-            }
-        }
-        
-        stage('GCP Authentication') {
-            when {
-                expression { 
-                    env.API_CHANGED == 'true' || env.DAG_CHANGED == 'true' 
-                }
-            }
-            steps {
-                script {
-                    echo "Authenticating with GCP..."
-                    sh """
-                        gcloud auth activate-service-account --key-file=\${GCP_SA_KEY}
-                        gcloud config set project \${GCP_PROJECT_ID}
-                    """
-                }
-            }
-        }
-        
-        stage('API Deployment') {
-            when {
-                expression { env.API_CHANGED == 'true' }
-            }
-            stages {
-                stage('Docker Build') {
-                    steps {
-                        script {
-                            echo "Building Docker image for API..."
+
+                    /* ============================================================
+                       DEPLOY: GCS (ONLY CHANGED FILES)
+                    ============================================================ */
+                    if (type == 'GCS') {
+                        def bucket = env["DEPLOY_${name}_GCS_BUCKET"]
+                        def prefix = env["DEPLOY_${name}_GCS_PREFIX"]
+
+                        if (!bucket || !prefix) {
+                            error("❌ Missing GCS config for ${name}")
+                        }
+
+                        echo "🪣 Deploying changed files to GCS for ${name}"
+
+                        changedFiles.split('\n').each { file ->
                             sh """
-                                cd ${API_PATH}
-                                docker build -t ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
-                            """
-                            echo "✅ Built image: ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-                        }
-                    }
-                }
-                
-                stage('Push to Artifact Registry') {
-                    steps {
-                        script {
-                            echo "Pushing Docker image to Artifact Registry..."
-                            sh """
-                                gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev
-                                docker push ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
-                            """
-                            echo "✅ Pushed: ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
-                        }
-                    }
-                }
-                
-                stage('Deploy to Cloud Run') {
-                    steps {
-                        script {
-                            echo "Deploying to Cloud Run (${env.TARGET_ENV})..."
-                            sh """
-                                gcloud run deploy ${CLOUD_RUN_SERVICE} \
-                                    --image=${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
-                                    --region=${GCP_REGION} \
-                                    --platform=managed \
-                                    --allow-unauthenticated \
-                                    --max-instances=10 \
-                                    --memory=512Mi \
-                                    --cpu=1 \
-                                    --timeout=300s \
-                                    --port=8080
-                            """
-                            
-                            // Get Cloud Run URL
-                            env.CLOUD_RUN_URL = sh(
-                                script: "gcloud run services describe ${CLOUD_RUN_SERVICE} --region=${GCP_REGION} --format='value(status.url)'",
-                                returnStdout: true
-                            ).trim()
-                            
-                            echo "✅ API deployed successfully to: ${env.CLOUD_RUN_URL}"
-                        }
-                    }
-                }
-                
-                stage('Health Check') {
-                    steps {
-                        script {
-                            echo "Performing health check on deployed API..."
-                            retry(3) {
-                                sleep(time: 5, unit: 'SECONDS')
-                                sh """
-                                    curl -f ${env.CLOUD_RUN_URL}/health || curl -f ${env.CLOUD_RUN_URL}/ || exit 1
-                                """
-                            }
-                            echo "✅ Health check passed"
-                        }
-                    }
-                }
-            }
-        }
-        
-        stage('DAG Deployment') {
-            when {
-                expression { env.DAG_CHANGED == 'true' }
-            }
-            stages {
-                stage('Validate DAG Files') {
-                    steps {
-                        script {
-                            echo "Validating DAG files..."
-                            sh """
-                                cd ${DAG_PATH}
-                                
-                                # Check for Python syntax errors
-                                find . -name "*.py" -exec python3 -m py_compile {} \\;
-                                
-                                echo "✅ DAG validation completed"
+                                gsutil cp ${file} gs://${bucket}/${prefix}/${file.replaceFirst("^${path}/?", "")}
                             """
                         }
                     }
-                }
-                
-                stage('Sync to Cloud Storage') {
-                    steps {
-                        script {
-                            echo "Syncing DAG files to Cloud Storage (${env.TARGET_ENV})..."
-                            sh """
-                                gsutil -m rsync -r -d ${DAG_PATH} ${GCS_BUCKET}/dags/
-                                
-                                # Set appropriate permissions
-                                gsutil -m acl ch -r -u AllUsers:R ${GCS_BUCKET}/dags/ || true
-                            """
-                            echo "✅ DAG files synced to: ${env.GCS_BUCKET}/dags/"
-                        }
+
+                    /* ============================================================
+                       DEPLOY: CLOUD RUN
+                    ============================================================ */
+                    else if (type == 'CLOUDRUN') {
+                        echo "☁️ Deploying ${name} to Cloud Run"
+                        deployToCloudRun(name)
                     }
-                }
-                
-                stage('Verify Cloud Composer') {
-                    steps {
-                        script {
-                            echo "Verifying Cloud Composer can access DAGs..."
-                            sh """
-                                # List uploaded files
-                                gsutil ls ${GCS_BUCKET}/dags/
-                            """
-                            echo "✅ DAG deployment completed. Airflow will refresh DAGs automatically."
-                        }
+
+                    else {
+                        error("❌ Unknown DEPLOY type for ${name}")
                     }
                 }
             }
-        }
-        
-        stage('Cleanup Docker Images') {
-            when {
-                expression { env.API_CHANGED == 'true' }
-            }
-            steps {
-                script {
-                    echo "Cleaning up local Docker images..."
-                    sh """
-                        docker rmi ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} || true
-                        docker system prune -f
-                    """
-                }
-            }
-        }
-        
-        stage('Branch Cleanup') {
-            when {
-                anyOf {
-                    expression { params.RUN_BRANCH_CLEANUP == true }
-                    expression { env.TARGET_ENV == 'PROD' } // Auto-cleanup after prod deploys
-                }
-            }
-            stages {
-                stage('Fetch All Branches') {
-                    steps {
-                        script {
-                            echo "=" * 80
-                            echo "Starting Branch Cleanup Process"
-                            echo "=" * 80
-                            sh 'git fetch --prune origin'
-                        }
-                    }
-                }
-                
-                stage('Identify Stale Branches') {
-                    steps {
-                        script {
-                            echo "Scanning for stale branches (older than ${env.BRANCH_CLEANUP_DAYS} days)..."
-                            
-                            // Get list of all remote branches with their last commit dates
-                            def branchesScript = """
-                                git for-each-ref --sort=-committerdate refs/remotes/origin/ \
-                                    --format='%(refname:short)|%(committerdate:unix)|%(authorname)' | \
-                                    sed 's|origin/||'
-                            """
-                            
-                            def branchesOutput = sh(script: branchesScript, returnStdout: true).trim()
-                            def branches = branchesOutput.split('\n')
-                            
-                            def currentTimestamp = sh(script: 'date +%s', returnStdout: true).trim().toLong()
-                            def thresholdSeconds = env.BRANCH_CLEANUP_DAYS.toInteger() * 24 * 60 * 60
-                            def protectedList = env.PROTECTED_BRANCHES.split(',').collect { it.trim() }
-                            
-                            def staleBranches = []
-                            def protectedBranches = []
-                            def activeBranches = []
-                            
-                            branches.each { branchInfo ->
-                                if (branchInfo.trim()) {
-                                    def parts = branchInfo.split('\\|')
-                                    def branchName = parts[0]
-                                    def commitTimestamp = parts[1].toLong()
-                                    def author = parts.size() > 2 ? parts[2] : 'Unknown'
-                                    
-                                    def ageInDays = ((currentTimestamp - commitTimestamp) / (24 * 60 * 60)).toInteger()
-                                    
-                                    // Skip HEAD
-                                    if (branchName == 'HEAD') {
-                                        return
-                                    }
-                                    
-                                    // Check if branch is protected
-                                    if (protectedList.contains(branchName)) {
-                                        protectedBranches << [name: branchName, age: ageInDays, author: author]
-                                        return
-                                    }
-                                    
-                                    // Check if branch is stale
-                                    if ((currentTimestamp - commitTimestamp) > thresholdSeconds) {
-                                        staleBranches << [name: branchName, age: ageInDays, author: author]
-                                    } else {
-                                        activeBranches << [name: branchName, age: ageInDays, author: author]
-                                    }
-                                }
-                            }
-                            
-                            // Store results
-                            env.STALE_BRANCHES_COUNT = staleBranches.size().toString()
-                            env.ACTIVE_BRANCHES_COUNT = activeBranches.size().toString()
-                            env.PROTECTED_BRANCHES_COUNT = protectedBranches.size().toString()
-                            
-                            // Generate report
-                            def report = "\n" + "=" * 80 + "\n"
-                            report += "Branch Cleanup Report\n"
-                            report += "=" * 80 + "\n\n"
-                            
-                            report += "📊 Summary:\n"
-                            report += "-" * 80 + "\n"
-                            report += "Total Branches Scanned: ${branches.size()}\n"
-                            report += "Protected Branches: ${protectedBranches.size()}\n"
-                            report += "Active Branches: ${activeBranches.size()}\n"
-                            report += "Stale Branches (${env.BRANCH_CLEANUP_DAYS}+ days): ${staleBranches.size()}\n\n"
-                            
-                            if (staleBranches.size() > 0) {
-                                report += "🗑️  Stale Branches to be deleted:\n"
-                                report += "-" * 80 + "\n"
-                                staleBranches.sort { -it.age }.each { branch ->
-                                    report += sprintf("%-40s | %4d days | %s\n", 
-                                        branch.name, branch.age, branch.author)
-                                }
-                                report += "\n"
-                            } else {
-                                report += "✅ No stale branches found!\n\n"
-                            }
-                            
-                            echo report
-                            
-                            // Save report to workspace
-                            writeFile file: 'branch-cleanup-report.txt', text: report
-                            
-                            // Save stale branches list for next stage
-                            if (staleBranches.size() > 0) {
-                                def branchList = staleBranches.collect { it.name }.join('\n')
-                                writeFile file: 'stale-branches.txt', text: branchList
-                            }
-                        }
-                    }
-                }
-                
-                stage('Delete Stale Branches') {
-                    when {
-                        expression { env.STALE_BRANCHES_COUNT.toInteger() > 0 }
-                    }
-                    steps {
-                        script {
-                            echo "Deleting ${env.STALE_BRANCHES_COUNT} stale branches from remote repository..."
-                            
-                            def staleBranches = readFile('stale-branches.txt').split('\n')
-                            def deletedCount = 0
-                            def failedCount = 0
-                            def failedBranches = []
-                            
-                            staleBranches.each { branchName ->
-                                if (branchName.trim()) {
-                                    try {
-                                        echo "Deleting branch: ${branchName}"
-                                        sh """
-                                            git push origin --delete ${branchName}
-                                        """
-                                        deletedCount++
-                                        echo "✅ Deleted: ${branchName}"
-                                    } catch (Exception e) {
-                                        failedCount++
-                                        failedBranches << branchName
-                                        echo "❌ Failed to delete: ${branchName} - ${e.message}"
-                                    }
-                                }
-                            }
-                            
-                            env.DELETED_COUNT = deletedCount.toString()
-                            env.FAILED_COUNT = failedCount.toString()
-                            
-                            def deletionSummary = "\nDeletion Summary:\n"
-                            deletionSummary += "-" * 80 + "\n"
-                            deletionSummary += "Successfully Deleted: ${deletedCount} branches\n"
-                            
-                            if (failedCount > 0) {
-                                deletionSummary += "Failed to Delete: ${failedCount} branches\n"
-                                deletionSummary += "\nFailed Branches:\n"
-                                failedBranches.each { branch ->
-                                    deletionSummary += "  - ${branch}\n"
-                                }
-                            }
-                            
-                            echo deletionSummary
-                            
-                            // Append to report
-                            sh """
-                                echo "\n${deletionSummary}" >> branch-cleanup-report.txt
-                            """
-                        }
-                    }
-                }
-                
-                stage('Archive Cleanup Report') {
-                    when {
-                        expression { fileExists('branch-cleanup-report.txt') }
-                    }
-                    steps {
-                        script {
-                            echo "Archiving cleanup report..."
-                            archiveArtifacts artifacts: 'branch-cleanup-report.txt', fingerprint: true
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    post {
-        success {
-            script {
-                def deploymentSummary = "🎉 Pipeline Completed Successfully!\n\n"
-                deploymentSummary += "Triggered by: Bitbucket Webhook\n"
-                deploymentSummary += "Branch: ${env.GIT_BRANCH}\n"
-                deploymentSummary += "Environment: ${env.TARGET_ENV}\n\n"
-                
-                if (env.API_CHANGED == 'true') {
-                    deploymentSummary += "✅ API Deployment:\n"
-                    deploymentSummary += "   - Image: ${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}\n"
-                    deploymentSummary += "   - Service: ${env.CLOUD_RUN_SERVICE}\n"
-                    deploymentSummary += "   - URL: ${env.CLOUD_RUN_URL}\n\n"
-                }
-                
-                if (env.DAG_CHANGED == 'true') {
-                    deploymentSummary += "✅ DAG Deployment:\n"
-                    deploymentSummary += "   - Bucket: ${env.GCS_BUCKET}/dags/\n"
-                    deploymentSummary += "   - Cloud Composer will refresh automatically\n\n"
-                }
-                
-                if (env.STALE_BRANCHES_COUNT && env.STALE_BRANCHES_COUNT.toInteger() > 0) {
-                    deploymentSummary += "🗑️  Branch Cleanup:\n"
-                    deploymentSummary += "   - Stale branches found: ${env.STALE_BRANCHES_COUNT}\n"
-                    deploymentSummary += "   - Successfully deleted: ${env.DELETED_COUNT ?: '0'}\n"
-                    if (env.FAILED_COUNT && env.FAILED_COUNT.toInteger() > 0) {
-                        deploymentSummary += "   - Failed to delete: ${env.FAILED_COUNT}\n"
-                    }
-                    deploymentSummary += "\n"
-                }
-                
-                deploymentSummary += "Build: #${BUILD_NUMBER}\n"
-                deploymentSummary += "Commit: ${GIT_COMMIT.take(7)}\n"
-                
-                echo deploymentSummary
-                
-                // Set build description for easy identification
-                def description = "${env.TARGET_ENV}: "
-                if (env.API_CHANGED == 'true') description += "API✅ "
-                if (env.DAG_CHANGED == 'true') description += "DAG✅ "
-                if (env.STALE_BRANCHES_COUNT && env.STALE_BRANCHES_COUNT.toInteger() > 0) {
-                    description += "Cleanup:${env.DELETED_COUNT}🗑️"
-                }
-                currentBuild.description = description
-            }
-        }
-        
-        failure {
-            script {
-                def failureMessage = "❌ Pipeline Failed!\n\n"
-                failureMessage += "Triggered by: Bitbucket Webhook\n"
-                failureMessage += "Branch: ${env.GIT_BRANCH}\n"
-                failureMessage += "Environment: ${env.TARGET_ENV}\n"
-                failureMessage += "Build: #${BUILD_NUMBER}\n"
-                failureMessage += "Commit: ${GIT_COMMIT.take(7)}\n\n"
-                failureMessage += "Check Jenkins console output for details:\n"
-                failureMessage += "${BUILD_URL}console"
-                
-                echo failureMessage
-            }
-        }
-        
-        always {
-            cleanWs()
         }
     }
 }

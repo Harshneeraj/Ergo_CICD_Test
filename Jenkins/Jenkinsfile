@@ -2,8 +2,6 @@ pipeline {
     agent any
 
     options {
-        // Multibranch already does checkout scm
-        // Keep workspace clean
         timestamps()
     }
 
@@ -16,24 +14,18 @@ pipeline {
     }
 
     environment {
-        // Credentials are safe here
         GCP_SA_KEY = "abc"
     }
 
     stages {
 
-        /* ============================================================
-           INIT + BRANCH + IMAGE TAG
-        ============================================================ */
         stage('Init') {
             steps {
                 script {
                     echo "Branch name: ${env.BRANCH_NAME}"
                     echo "Commit: ${env.GIT_COMMIT}"
 
-                    // Compute IMAGE_TAG AFTER checkout
                     env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(7)}"
-                    echo "Image tag: ${env.IMAGE_TAG}"
 
                     if (env.BRANCH_NAME in ['prod', 'main']) {
                         env.ENV_FILE   = 'Jenkins/prod.env'
@@ -51,9 +43,6 @@ pipeline {
             }
         }
 
-        /* ============================================================
-           LOAD ENV FILE
-        ============================================================ */
         stage('Load Environment Config') {
             steps {
                 script {
@@ -61,79 +50,87 @@ pipeline {
                         error("❌ ${env.ENV_FILE} not found in repo")
                     }
 
-                    readFile(env.ENV_FILE).split('\n').each { line ->
-                        line = line.trim()
-                        if (!line || line.startsWith('#')) return
-
-                        def (k, v) = line.split('=', 2)
-                        env[k] = v
-                    }
-
-                    echo "✅ Environment variables loaded"
+                    env.DYNAMIC_ENV = readFile(env.ENV_FILE)
                 }
             }
         }
 
-        /* ============================================================
-           DETECT CHANGED DEPLOYMENTS
-        ============================================================ */
         stage('Detect Changes') {
             steps {
                 script {
-                    def deployments = []
+                    def envMap = [:]
 
-                    env.each { k, v ->
-                        if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
-                            deployments << k
-                                .replace('DEPLOY_', '')
-                                .replace('_PATH', '')
-                        }
+                    env.DYNAMIC_ENV.split('\n').each { line ->
+                        line = line.trim()
+                        if (!line || line.startsWith('#')) return
+                        def (k, v) = line.split('=', 2)
+                        envMap[k] = v
                     }
 
-                    def changed = []
+                    withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
 
-                    deployments.each { name ->
-                        def path = env["DEPLOY_${name}_PATH"]
+                        def deployments = []
 
-                        def diff = sh(
-                            script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
-                            returnStdout: true
-                        ).trim()
-
-                        if (diff || params.FORCE_DEPLOY) {
-                            changed << name
+                        env.each { k, v ->
+                            if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
+                                deployments << k.replace('DEPLOY_', '').replace('_PATH', '')
+                            }
                         }
-                    }
 
-                    if (changed.isEmpty()) {
-                        echo "⚠️ No changes detected"
-                        env.SKIP_DEPLOY = 'true'
-                    } else {
-                        env.CHANGED_DEPLOYS = changed.join(',')
-                        echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
+                        def changed = []
+
+                        deployments.each { name ->
+                            def path = env["DEPLOY_${name}_PATH"]
+
+                            def diff = sh(
+                                script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
+                                returnStdout: true
+                            ).trim()
+
+                            if (diff || params.FORCE_DEPLOY) {
+                                changed << name
+                            }
+                        }
+
+                        if (changed.isEmpty()) {
+                            echo "⚠️ No changes detected"
+                            env.SKIP_DEPLOY = 'true'
+                        } else {
+                            env.CHANGED_DEPLOYS = changed.join(',')
+                            echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
+                        }
                     }
                 }
             }
         }
 
-        /* ============================================================
-           DEPLOY
-        ============================================================ */
         stage('Deploy') {
             when {
                 expression { env.SKIP_DEPLOY != 'true' }
             }
             steps {
                 script {
-                    env.CHANGED_DEPLOYS.split(',').each { name ->
-                        def type = env["DEPLOY_${name}_TYPE"]
+                    def envMap = [:]
 
-                        if (type == 'GCS') {
-                            deployToGCS(name)
-                        } else if (type == 'CLOUDRUN') {
-                            deployToCloudRun(name)
-                        } else {
-                            error("❌ Unknown DEPLOY type for ${name}")
+                    env.DYNAMIC_ENV.split('\n').each { line ->
+                        line = line.trim()
+                        if (!line || line.startsWith('#')) return
+                        def (k, v) = line.split('=', 2)
+                        envMap[k] = v
+                    }
+
+                    withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
+
+                        env.CHANGED_DEPLOYS.split(',').each { name ->
+                            def type = env["DEPLOY_${name}_TYPE"]
+
+                            if (type == 'GCS') {
+                                deployToGCS(name)
+                            } else if (type == 'CLOUDRUN') {
+                                deployToCloudRun(name)
+                            } else {
+                                error("❌ Unknown DEPLOY type for ${name}")
+                            }
                         }
                     }
                 }
@@ -149,43 +146,11 @@ pipeline {
             echo "❌ Deployment failed"
         }
         always {
-            cleanWs()
+            script {
+                if (env.WORKSPACE) {
+                    cleanWs()
+                }
+            }
         }
     }
-}
-
-/* ============================================================
-   FUNCTIONS
-============================================================ */
-
-def deployToGCS(name) {
-    def path   = env["DEPLOY_${name}_PATH"]
-    def bucket = env["DEPLOY_${name}_GCS_BUCKET"]
-    def prefix = env["DEPLOY_${name}_GCS_PREFIX"]
-
-    echo "🪣 Deploying ${name} to GCS"
-
-    sh """
-        gsutil -m rsync -r -d ${path} gs://${bucket}/${prefix}/
-    """
-}
-
-def deployToCloudRun(name) {
-    def path    = env["DEPLOY_${name}_PATH"]
-    def image   = env["DEPLOY_${name}_IMAGE"]
-    def service = env["DEPLOY_${name}_SERVICE"]
-
-    echo "☁️ Deploying ${name} to Cloud Run"
-
-    sh """
-        cd ${path}
-        docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${image}:${IMAGE_TAG} .
-        docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${image}:${IMAGE_TAG}
-
-        gcloud run deploy ${service} \
-            --image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${image}:${IMAGE_TAG} \
-            --region=${REGION} \
-            --platform=managed \
-            --allow-unauthenticated
-    """
 }

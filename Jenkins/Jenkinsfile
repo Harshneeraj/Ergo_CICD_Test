@@ -43,24 +43,19 @@ pipeline {
             }
         }
 
-        stage('Load Environment Config') {
+        stage('Detect Changes') {
             steps {
                 script {
                     if (!fileExists(env.ENV_FILE)) {
                         error("❌ ${env.ENV_FILE} not found in repo")
                     }
 
-                    env.DYNAMIC_ENV = readFile(env.ENV_FILE)
-                }
-            }
-        }
+                    // Read file LOCALLY (not env)
+                    def envContent = readFile(env.ENV_FILE)
 
-        stage('Detect Changes') {
-            steps {
-                script {
                     def envMap = [:]
 
-                    env.DYNAMIC_ENV.split('\n').each { line ->
+                    envContent.split('\n').each { line ->
                         line = line.trim()
                         if (!line || line.startsWith('#')) return
 
@@ -68,42 +63,43 @@ pipeline {
                         envMap.put(parts[0], parts[1])
                     }
 
-                    // withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
+                    withEnv(envMap.collect { k, v -> "${k}=${v}" }) {
 
-                    //     def deployments = []
+                        def deployments = []
 
-                    //     env.each { k, v ->
-                    //         if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
-                    //             deployments << k.replace('DEPLOY_', '').replace('_PATH', '')
-                    //         }
-                    //     }
+                        env.each { k, v ->
+                            if (k.startsWith('DEPLOY_') && k.endsWith('_PATH')) {
+                                deployments << k.replace('DEPLOY_', '').replace('_PATH', '')
+                            }
+                        }
 
-                    //     def changed = []
+                        def changed = []
 
-                    //     deployments.each { name ->
-                    //         def path = env["DEPLOY_${name}_PATH"]
+                        deployments.each { name ->
+                            def path = env["DEPLOY_${name}_PATH"]
 
-                    //         def diff = sh(
-                    //             script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
-                    //             returnStdout: true
-                    //         ).trim()
+                            def diff = sh(
+                                script: "git diff HEAD~1 HEAD --name-only | grep '^${path}' || true",
+                                returnStdout: true
+                            ).trim()
 
-                    //         if (diff || params.FORCE_DEPLOY) {
-                    //             changed << name
-                    //         }
-                    //     }
+                            if (diff || params.FORCE_DEPLOY) {
+                                changed << name
+                            }
+                        }
 
-                    //     if (changed.isEmpty()) {
-                    //         echo "⚠️ No changes detected"
-                    //         env.SKIP_DEPLOY = 'true'
-                    //     } else {
-                    //         env.CHANGED_DEPLOYS = changed.join(',')
-                    //         echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
-                    //     }
-                    // }
+                        if (changed.isEmpty()) {
+                            echo "⚠️ No changes detected"
+                            env.SKIP_DEPLOY = 'true'
+                        } else {
+                            env.CHANGED_DEPLOYS = changed.join(',')
+                            echo "Components to deploy: ${env.CHANGED_DEPLOYS}"
+                        }
+                    }
                 }
             }
         }
+
 
         stage('Deploy') {
             when {
